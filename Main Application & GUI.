@@ -1,0 +1,1127 @@
+import cv2 #app.py
+import mediapipe as mp
+import numpy as np
+import socket
+import threading
+import time
+import os
+from datetime import datetime
+
+from flask import Flask, render_template, request, jsonify, send_from_directory
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from fpdf import FPDF
+
+
+base_dir = os.path.dirname(os.path.abspath(__file__))
+
+app = Flask(
+    __name__,
+    template_folder=os.path.join(base_dir, "templates"),
+    static_folder=os.path.join(base_dir, "templates")
+)
+
+carpeta_reportes = os.path.join(base_dir, "reportes")
+os.makedirs(carpeta_reportes, exist_ok=True)
+
+
+# =========================================================================
+# CONFIGURACION
+# =========================================================================
+
+NAO_IP = "192.168.1.27"
+NAO_PORT = 5000
+
+MOSTRAR_CAMARA = False
+
+mp_pose = mp.solutions.pose
+mp_dibujo = mp.solutions.drawing_utils
+
+evento_paciente_listo = threading.Event()
+
+reporte_listo = None
+terapia_activa = False
+ultimo_estado = "Sistema listo"
+
+RUTINA_COMPLETA = ["abduccion", "flexion", "rotacion", "codo"]
+
+NOMBRES_TRAMPAS = {
+    "TRAMPA_BRAZO_DOBLADO": "Brazo o codo doblado",
+    "TRAMPA_TORSO": "Inclinacion de tronco",
+    "TRAMPA_CUELLO": "Compensacion de cuello",
+    "TRAMPA_CODO_SEPARADO": "Codo separado",
+    "TRAMPA_BALANCEO": "Balanceo corporal"
+}
+
+INTERVENCIONES_NAO = {
+    "TRAMPA_BRAZO_DOBLADO": "Intenta mantener el brazo mas estirado.",
+    "TRAMPA_TORSO": "Cuida tu postura. Manten el tronco estable.",
+    "TRAMPA_CUELLO": "Relaja el cuello y mira al frente.",
+    "TRAMPA_CODO_SEPARADO": "Manten el codo cerca de tu cuerpo.",
+    "TRAMPA_BALANCEO": "Evita balancearte. Hazlo lento y controlado."
+}
+
+CONFIG_MOVIMIENTOS = {
+    "abduccion": {
+        "nombre": "Abduccion de hombro",
+        "objetivo": 90.0,
+        "comando": "DEMO_ABDUCCION",
+        "series": 1,
+        "reps": 12
+    },
+    "flexion": {
+        "nombre": "Flexion anterior",
+        "objetivo": 130.0,
+        "comando": "DEMO_FLEXION",
+        "series": 2,
+        "reps": 10
+    },
+    "rotacion": {
+        "nombre": "Rotacion externa",
+        "objetivo": 60.0,
+        "comando": "DEMO_ROTACION",
+        "series": 1,
+        "reps": 8
+    },
+    "codo": {
+        "nombre": "Flexion de codo",
+        "objetivo": 110.0,
+        "comando": "DEMO_CODO",
+        "series": 2,
+        "reps": 10
+    }
+}
+
+UMBRALES_FASE = {
+    "abduccion": {"inicio": 20.0, "reposo": 15.0},
+    "flexion": {"inicio": 20.0, "reposo": 15.0},
+    "rotacion": {"inicio": 12.0, "reposo": 12.0},
+    "codo": {"inicio": 25.0, "reposo": 35.0}
+}
+
+TIEMPO_ATORADO_SEG = 3.0
+DELTA_ATORADO_GRADOS = 4.0
+
+
+# =========================================================================
+# UTILIDADES
+# =========================================================================
+
+def actualizar_estado(texto):
+    global ultimo_estado
+    ultimo_estado = texto
+    print(texto)
+
+
+def limpiar_nombre_archivo(texto):
+    texto = texto.strip() or "Paciente"
+    invalidos = '<>:"/\\|?*'
+    for caracter in invalidos:
+        texto = texto.replace(caracter, "_")
+    return texto.replace(" ", "_")
+
+
+def enviar_comando_nao(mensaje):
+    try:
+        actualizar_estado(f"Enviando a Mochi: {mensaje}")
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect((NAO_IP, NAO_PORT))
+        s.sendall(mensaje.encode("utf-8"))
+        s.close()
+
+        return True
+
+    except Exception as e:
+        actualizar_estado(f"Error conectando con Mochi: {e}")
+        return False
+
+
+def calcular_angulo_3d(a, b, c):
+    a, b, c = np.array(a), np.array(b), np.array(c)
+
+    ba = a - b
+    bc = c - b
+
+    norm_ba = np.linalg.norm(ba)
+    norm_bc = np.linalg.norm(bc)
+
+    if norm_ba == 0 or norm_bc == 0:
+        return 0.0
+
+    coseno = np.dot(ba, bc) / (norm_ba * norm_bc)
+    coseno = np.clip(coseno, -1.0, 1.0)
+
+    return np.degrees(np.arccos(coseno))
+
+
+def a_3d(landmark):
+    return [landmark.x, landmark.y, landmark.z]
+
+
+def a_px(landmark, w, h):
+    return [landmark.x * w, landmark.y * h]
+
+
+def crear_trampas_detalle():
+    return {
+        "TRAMPA_BRAZO_DOBLADO": 0,
+        "TRAMPA_TORSO": 0,
+        "TRAMPA_CUELLO": 0,
+        "TRAMPA_CODO_SEPARADO": 0,
+        "TRAMPA_BALANCEO": 0
+    }
+
+
+def sumar_trampas_detalle(destino, fuente):
+    for clave, cantidad in fuente.items():
+        destino[clave] = destino.get(clave, 0) + cantidad
+
+
+def crear_evento_trampa(tipo, repeticion_estimada, angulo_movimiento, magnitud, umbral):
+    return {
+        "repeticion": repeticion_estimada,
+        "tipo": tipo,
+        "nombre": NOMBRES_TRAMPAS.get(tipo, tipo),
+        "angulo_movimiento": round(float(angulo_movimiento), 1),
+        "magnitud": round(float(magnitud), 1),
+        "umbral": round(float(umbral), 1),
+        "intervencion": INTERVENCIONES_NAO.get(tipo, "Correccion verbal del NAO.")
+    }
+
+
+def clasificar_fluidez(angulos):
+    if len(angulos) < 6:
+        return "Sin datos suficientes", 0.0
+
+    diffs = np.diff(angulos)
+    variabilidad = float(np.std(diffs))
+
+    if variabilidad < 2.5:
+        return "Movimiento suave", variabilidad
+    if variabilidad < 6.0:
+        return "Movimiento moderadamente fluido", variabilidad
+    return "Movimiento irregular o a tirones", variabilidad
+
+
+def calcular_fatiga(roms):
+    if len(roms) < 6:
+        return "No hay repeticiones suficientes para estimar fatiga.", 0.0
+
+    primeras = np.mean(roms[:3])
+    ultimas = np.mean(roms[-3:])
+
+    if primeras <= 0:
+        return "No se pudo estimar fatiga por falta de ROM inicial valido.", 0.0
+
+    caida = ((primeras - ultimas) / primeras) * 100
+
+    if caida >= 15:
+        return f"Posible fatiga: el ROM decayó {caida:.1f}% en las ultimas 3 repeticiones.", caida
+
+    return f"Sin caida relevante de ROM: variacion final {caida:.1f}%.", caida
+
+
+def interpretar_patron_trampas(detalle_repeticiones):
+    reps_con_trampa = [
+        rep["repeticion"]
+        for rep in detalle_repeticiones
+        if rep["resultado"] != "Correcta"
+    ]
+
+    total = len(detalle_repeticiones)
+
+    if not reps_con_trampa:
+        return "No se observaron compensaciones relevantes durante la serie."
+
+    if total >= 6:
+        primeras = set(range(1, 4))
+        ultimas = set(range(max(1, total - 2), total + 1))
+
+        trampas_inicio = len([r for r in reps_con_trampa if r in primeras])
+        trampas_final = len([r for r in reps_con_trampa if r in ultimas])
+
+        if trampas_final >= 2 and trampas_inicio == 0:
+            return (
+                "Las compensaciones aparecen principalmente al final de la serie. "
+                "Esto sugiere posible fatiga: el paciente logra la tarea, pero pierde control "
+                "con la repeticion acumulada. Considerar mantener la carga, reducir repeticiones "
+                "o aumentar descanso."
+            )
+
+        if trampas_inicio >= 2:
+            return (
+                "Las compensaciones aparecen desde el inicio. Esto puede indicar que el ejercicio "
+                "es demasiado dificil para el nivel actual o que requiere mas instruccion verbal "
+                "y demostracion antes de progresar."
+            )
+
+    return (
+        "Las compensaciones aparecen de forma distribuida. Se recomienda revisar tecnica, ritmo "
+        "de ejecucion y control postural antes de progresar carga o volumen."
+    )
+
+
+def recomendacion_clinica(ejercicio, indice_calidad, rom_promedio, objetivo, trampas_totales, roms, fluidez_texto):
+    porcentaje_rom = (rom_promedio / objetivo * 100) if objetivo > 0 else 0
+    fatiga_texto, caida_fatiga = calcular_fatiga(roms)
+
+    recomendaciones = []
+
+    if indice_calidad >= 80 and porcentaje_rom >= 90 and trampas_totales <= 2:
+        if ejercicio.lower().startswith("abduccion") or ejercicio.lower().startswith("rotacion"):
+            recomendaciones.append(
+                "Progresion de carga: considerar banda elastica ligera de resistencia minima "
+                "para fortalecer el manguito rotador sin comprometer la articulacion."
+            )
+        else:
+            recomendaciones.append(
+                "Progresion de carga: considerar mancuerna ligera de 0.5 kg a 1 kg, "
+                "vigilando que no aparezca brazo doblado, balanceo o compensacion de tronco."
+            )
+
+        recomendaciones.append(
+            "Dosis de ejercicio: si se mantiene buena tecnica y baja fatiga, el terapeuta "
+            "puede valorar aumentar de 10 a 15 repeticiones."
+        )
+
+    elif indice_calidad >= 65 and porcentaje_rom >= 75:
+        recomendaciones.append(
+            "Mantener nivel actual. Priorizar tecnica limpia, control postural y descenso lento "
+            "antes de aumentar carga o repeticiones."
+        )
+
+    else:
+        recomendaciones.append(
+            "No progresar carga. Repetir nivel actual con asistencia, descansos suficientes "
+            "y vigilancia de compensaciones."
+        )
+
+    if caida_fatiga >= 15:
+        recomendaciones.append(
+            "Monitorear fatiga: la caida de ROM sugiere reducir volumen, aumentar descanso "
+            "o disminuir carga."
+        )
+
+    if fluidez_texto == "Movimiento irregular o a tirones":
+        recomendaciones.append(
+            "Control neuromuscular: se observaron cambios bruscos de velocidad. "
+            "Recomendar movimiento mas lento y control excentrico durante la bajada."
+        )
+    else:
+        recomendaciones.append(
+            "Control motor: la fluidez observada es compatible con una ejecucion controlada "
+            "para el nivel evaluado."
+        )
+
+    if ejercicio.lower().startswith("abduccion") and indice_calidad >= 80:
+        recomendaciones.append(
+            "Desafio biomecanico futuro: valorar isometrico a 90 grados durante 5 a 10 segundos "
+            "para medir estabilidad de la postura."
+        )
+
+    if ejercicio.lower().startswith("rotacion") and rom_promedio >= 55 and indice_calidad >= 80:
+        recomendaciones.append(
+            "Desafio biomecanico futuro: valorar rotacion externa con ligera abduccion, "
+            "solo si el terapeuta confirma estabilidad escapulohumeral."
+        )
+
+    recomendaciones.append(fatiga_texto)
+
+    return recomendaciones
+
+
+def sugerencia_juez(indice_calidad, rom_promedio, objetivo, trampas_totales, fluidez_texto):
+    porcentaje_rom = (rom_promedio / objetivo * 100) if objetivo > 0 else 0
+
+    if (
+        indice_calidad >= 85
+        and porcentaje_rom >= 90
+        and trampas_totales <= 2
+        and fluidez_texto in ["Movimiento suave", "Movimiento moderadamente fluido"]
+    ):
+        return "Paciente listo para avanzar a Nivel 2, bajo criterio del terapeuta."
+
+    if indice_calidad >= 65 and porcentaje_rom >= 75:
+        return "Mantener en Nivel 1 y reforzar control postural."
+
+    return "Repetir Nivel 1 con asistencia y vigilancia de compensaciones."
+
+
+# =========================================================================
+# PDF
+# =========================================================================
+
+def generar_reporte_pdf(datos_terapia, nombre_paciente, timestamp_str, nivel):
+    global reporte_listo
+
+    nombre_limpio = limpiar_nombre_archivo(nombre_paciente)
+    nombre_archivo = f"Reporte_{nombre_limpio}_{timestamp_str}.pdf"
+    ruta_pdf = os.path.join(carpeta_reportes, nombre_archivo)
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    logo_path = os.path.join(base_dir, "logo.png")
+    if os.path.exists(logo_path):
+        pdf.image(logo_path, x=10, y=8, w=22)
+
+    pdf.set_fill_color(15, 118, 110)
+    pdf.rect(0, 0, 210, 28, "F")
+
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Arial", "B", 15)
+    pdf.cell(0, 10, txt="Reporte Clinico de Desempeno Cinematico", ln=True, align="C")
+
+    pdf.set_font("Arial", "", 10)
+    pdf.cell(0, 8, txt="Sistema de terapia asistida con Mochi", ln=True, align="C")
+
+    pdf.ln(12)
+    pdf.set_text_color(0, 0, 0)
+
+    fecha = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 8, "Resumen ejecutivo", ln=True)
+
+    pdf.set_font("Arial", "", 10)
+    pdf.set_fill_color(245, 245, 245)
+
+    pdf.cell(45, 8, "Paciente", border=1, fill=True)
+    pdf.cell(60, 8, nombre_paciente, border=1)
+    pdf.cell(35, 8, "Fecha", border=1, fill=True)
+    pdf.cell(50, 8, fecha, border=1, ln=True)
+
+    pdf.cell(45, 8, "Nivel", border=1, fill=True)
+    pdf.cell(60, 8, str(nivel), border=1)
+    pdf.cell(35, 8, "Ejercicios", border=1, fill=True)
+    pdf.cell(50, 8, str(len(datos_terapia)), border=1, ln=True)
+
+    brazos = ", ".join(sorted(set([ej["brazo"] for ej in datos_terapia])))
+    pdf.cell(45, 8, "Brazo evaluado", border=1, fill=True)
+    pdf.cell(145, 8, brazos, border=1, ln=True)
+
+    pdf.ln(8)
+
+    for ej_data in datos_terapia:
+        ejercicio = ej_data["ejercicio"].upper()
+        brazo = ej_data["brazo"]
+        objetivo = ej_data["objetivo"]
+
+        buenas = ej_data["reps_buenas"]
+        intentadas = ej_data["intentadas"]
+        trampas_totales = ej_data["trampas_totales"]
+        roms = ej_data["historial_rom"]
+
+        indice_calidad = (buenas / intentadas * 100) if intentadas > 0 else 0
+        rom_promedio = np.mean(roms) if roms else 0
+        rom_maximo = max(roms) if roms else 0
+        variabilidad = np.std(roms) if roms else 0
+        mae_objetivo = np.mean([abs(objetivo - r) for r in roms]) if roms else 0
+
+        fluidez_texto = ej_data.get("fluidez", "Sin datos suficientes")
+        fluidez_valor = ej_data.get("fluidez_valor", 0.0)
+
+        recomendacion = sugerencia_juez(
+            indice_calidad,
+            rom_promedio,
+            objetivo,
+            trampas_totales,
+            fluidez_texto
+        )
+
+        recomendaciones_clinicas = recomendacion_clinica(
+            ejercicio,
+            indice_calidad,
+            rom_promedio,
+            objetivo,
+            trampas_totales,
+            roms,
+            fluidez_texto
+        )
+
+        patron_trampas = interpretar_patron_trampas(ej_data.get("detalle_repeticiones", []))
+
+        pdf.set_fill_color(15, 118, 110)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 9, f"Analisis: {ejercicio} - Brazo {brazo}", ln=True, fill=True)
+
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Arial", "", 10)
+
+        pdf.cell(65, 8, "Repeticiones validas / intentadas", border=1)
+        pdf.cell(35, 8, f"{buenas}/{intentadas}", border=1)
+        pdf.cell(50, 8, "Indice de calidad", border=1)
+        pdf.cell(40, 8, f"{indice_calidad:.1f}%", border=1, ln=True)
+
+        pdf.cell(65, 8, "ROM maximo vs objetivo", border=1)
+        pdf.cell(35, 8, f"{rom_maximo:.1f}/{objetivo:.1f}", border=1)
+        pdf.cell(50, 8, "ROM promedio", border=1)
+        pdf.cell(40, 8, f"{rom_promedio:.1f}", border=1, ln=True)
+
+        pdf.cell(65, 8, "Error medio vs objetivo", border=1)
+        pdf.cell(35, 8, f"{mae_objetivo:.1f}", border=1)
+        pdf.cell(50, 8, "Variabilidad ROM", border=1)
+        pdf.cell(40, 8, f"+/- {variabilidad:.1f}", border=1, ln=True)
+
+        pdf.cell(65, 8, "Clasificacion de fluidez", border=1)
+        pdf.cell(125, 8, fluidez_texto, border=1, ln=True)
+
+        pdf.ln(4)
+
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 7, "Desglose de compensaciones", ln=True)
+
+        pdf.set_font("Arial", "B", 10)
+        pdf.cell(120, 8, "Compensacion", border=1)
+        pdf.cell(35, 8, "Cantidad", border=1)
+        pdf.cell(35, 8, "Impacto", border=1, ln=True)
+
+        pdf.set_font("Arial", "", 9)
+        for clave, nombre in NOMBRES_TRAMPAS.items():
+            cantidad = ej_data["trampas_detalle"].get(clave, 0)
+            pdf.cell(120, 8, nombre, border=1)
+            pdf.cell(35, 8, str(cantidad), border=1)
+            pdf.cell(35, 8, "Seguridad", border=1, ln=True)
+
+        reps_con_trampa = [
+            rep for rep in ej_data.get("detalle_repeticiones", [])
+            if rep["resultado"] != "Correcta"
+        ]
+
+        pdf.ln(4)
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 7, "Repeticiones con compensacion", ln=True)
+
+        if reps_con_trampa:
+            pdf.set_font("Arial", "B", 8)
+            pdf.cell(15, 8, "Rep", border=1)
+            pdf.cell(25, 8, "Resultado", border=1)
+            pdf.cell(52, 8, "Trampa detectada", border=1)
+            pdf.cell(25, 8, "Magnitud", border=1)
+            pdf.cell(25, 8, "ROM", border=1)
+            pdf.cell(48, 8, "Intervencion NAO", border=1, ln=True)
+
+            pdf.set_font("Arial", "", 7)
+
+            for rep in reps_con_trampa:
+                pdf.cell(15, 8, str(rep["repeticion"]), border=1)
+                pdf.cell(25, 8, rep["resultado"][:14], border=1)
+                pdf.cell(52, 8, rep["trampa"][:32], border=1)
+                pdf.cell(25, 8, f'{rep["magnitud"]:.1f}', border=1)
+                pdf.cell(25, 8, f'{rep["angulo_rom"]:.1f}', border=1)
+                pdf.cell(48, 8, rep["intervencion"][:30], border=1, ln=True)
+        else:
+            pdf.set_font("Arial", "", 9)
+            pdf.multi_cell(0, 6, "No se registraron compensaciones por repeticion.")
+
+        pdf.ln(3)
+
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 7, "Interpretacion de fatiga y compensaciones", ln=True)
+        pdf.set_font("Arial", "", 9)
+        pdf.multi_cell(0, 6, patron_trampas)
+
+        pdf.ln(2)
+
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 7, "Sugerencia del juez", ln=True)
+        pdf.set_font("Arial", "", 10)
+        pdf.multi_cell(0, 7, recomendacion)
+
+        pdf.ln(2)
+
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 7, "Recomendaciones clinicas de progresion", ln=True)
+
+        pdf.set_font("Arial", "", 9)
+        for rec in recomendaciones_clinicas:
+            pdf.multi_cell(0, 6, "- " + rec)
+
+        pdf.set_font("Arial", "I", 8)
+        pdf.multi_cell(
+            0,
+            5,
+            "Nota: Estas recomendaciones son apoyo para la toma de decisiones clinicas "
+            "y no sustituyen el criterio del terapeuta."
+        )
+
+        pdf.ln(3)
+
+        if roms:
+            x_reps = list(range(1, len(roms) + 1))
+            img_rom = os.path.join(carpeta_reportes, f"rom_{ejercicio}_{brazo}_{timestamp_str}.png")
+
+            plt.figure(figsize=(6.5, 3.2))
+            plt.plot(x_reps, roms, marker="o", color="#2563eb", label="ROM paciente")
+            plt.axhline(y=objetivo, color="#dc2626", linestyle="--", label="Objetivo")
+            plt.title(f"ROM maximo por repeticion - {ejercicio}")
+            plt.xlabel("Repeticion")
+            plt.ylabel("Grados")
+            plt.xticks(x_reps)
+            plt.grid(True, linestyle="--", alpha=0.6)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(img_rom)
+            plt.close()
+
+            pdf.image(img_rom, x=15, w=170)
+
+            if os.path.exists(img_rom):
+                os.remove(img_rom)
+
+            pdf.ln(72)
+
+    pdf.ln(5)
+    pdf.set_font("Arial", "", 10)
+    pdf.cell(90, 8, "Firma del terapeuta:", ln=False)
+    pdf.cell(90, 8, "____________________________", ln=True)
+
+    pdf.output(ruta_pdf)
+    reporte_listo = nombre_archivo
+
+    actualizar_estado(f"Reporte listo: {nombre_archivo}")
+
+
+# =========================================================================
+# VISION
+# =========================================================================
+
+def seleccionar_puntos(p, brazo):
+    if brazo == "Izquierdo":
+        hombro = a_3d(p[12])
+        codo = a_3d(p[14])
+        muneca = a_3d(p[16])
+        cadera = a_3d(p[24])
+    else:
+        hombro = a_3d(p[11])
+        codo = a_3d(p[13])
+        muneca = a_3d(p[15])
+        cadera = a_3d(p[23])
+
+    h_izq = a_3d(p[12])
+    h_der = a_3d(p[11])
+    cad_izq = a_3d(p[24])
+    cad_der = a_3d(p[23])
+
+    return hombro, codo, muneca, cadera, h_izq, h_der, cad_izq, cad_der
+
+
+def calcular_angulo_ejercicio(nombre_ejercicio, hombro, codo, muneca, cadera):
+    if nombre_ejercicio in ["abduccion", "flexion"]:
+        return calcular_angulo_3d(cadera, hombro, codo)
+
+    if nombre_ejercicio == "codo":
+        angulo_interno = calcular_angulo_3d(hombro, codo, muneca)
+        return max(0.0, 180.0 - angulo_interno)
+
+    if nombre_ejercicio == "rotacion":
+        vec_antebrazo = np.array(muneca) - np.array(codo)
+        rotacion = np.degrees(np.arctan2(abs(vec_antebrazo[0]), abs(vec_antebrazo[2])))
+        return abs(rotacion)
+
+    return 0.0
+
+
+def actualizar_atorado(estado, angulo_actual, ahora):
+    if estado["angulo_ref"] is None:
+        estado["angulo_ref"] = angulo_actual
+        estado["tiempo_ref"] = ahora
+        return False
+
+    diferencia = abs(angulo_actual - estado["angulo_ref"])
+
+    if diferencia <= DELTA_ATORADO_GRADOS:
+        return (ahora - estado["tiempo_ref"]) >= TIEMPO_ATORADO_SEG
+
+    estado["angulo_ref"] = angulo_actual
+    estado["tiempo_ref"] = ahora
+    return False
+
+
+def ejecutar_vision_terapia(nombre_ejercicio, objetivo_grados, reps_objetivo, brazo):
+    cap = cv2.VideoCapture(0)
+
+    if not cap.isOpened():
+        actualizar_estado("No se pudo abrir la camara")
+        return {
+            "reps_buenas": 0,
+            "intentadas": 0,
+            "trampas_totales": 0,
+            "trampas_detalle": crear_trampas_detalle(),
+            "historial_rom": [],
+            "fluidez": "Sin datos suficientes",
+            "fluidez_valor": 0.0,
+            "detalle_repeticiones": []
+        }
+
+    umbral_inicio = UMBRALES_FASE[nombre_ejercicio]["inicio"]
+    umbral_reposo = UMBRALES_FASE[nombre_ejercicio]["reposo"]
+
+    if nombre_ejercicio == "codo":
+        umbral_reposo_dinamico = 35.0
+    else:
+        umbral_reposo_dinamico = max(umbral_reposo, objetivo_grados * 0.35)
+
+    reps_buenas = 0
+    intentadas = 0
+    fase = "REPOSO"
+
+    trampa_en_esta_rep = False
+    ultimo_aviso_trampa = 0
+    ultimo_aviso_movimiento = 0
+    sube_mas_avisado_en_rep = False
+    estado_atorado = {"angulo_ref": None, "tiempo_ref": None}
+
+    contador_trampa = 0
+    ultima_trampa_detectada = None
+    trampas_avisadas_en_rep = set()
+
+    rom_repeticion = 0
+    historial_roms = []
+    historial_angulos = []
+    trampas_cometidas = 0
+    trampas_detalle = crear_trampas_detalle()
+    detalle_repeticiones = []
+    eventos_trampa_rep = []
+
+    angulo_hombro_inicial = 0
+    inicio_subida = None
+
+    actualizar_estado(f"Iniciando vision: {nombre_ejercicio}, brazo {brazo}")
+
+    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+        while cap.isOpened() and reps_buenas < reps_objetivo:
+            ret, frame = cap.read()
+
+            if not ret:
+                actualizar_estado("No se pudo leer imagen de la camara")
+                break
+
+            frame = cv2.flip(frame, 1)
+            h_img, w_img, _ = frame.shape
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = pose.process(rgb)
+
+            angulo_actual = 0
+
+            if res.pose_world_landmarks and res.pose_landmarks:
+                p3 = res.pose_world_landmarks.landmark
+                p2 = res.pose_landmarks.landmark
+
+                hombro, codo, muneca, cadera, h_izq, h_der, cad_izq, cad_der = seleccionar_puntos(p3, brazo)
+
+                angulo_actual = calcular_angulo_ejercicio(
+                    nombre_ejercicio,
+                    hombro,
+                    codo,
+                    muneca,
+                    cadera
+                )
+
+                historial_angulos.append(angulo_actual)
+
+                h_izq_2d = a_px(p2[12], w_img, h_img)
+                h_der_2d = a_px(p2[11], w_img, h_img)
+                o_izq_2d = a_px(p2[8], w_img, h_img)
+                o_der_2d = a_px(p2[7], w_img, h_img)
+
+                p_esternon = [
+                    (h_izq_2d[0] + h_der_2d[0]) / 2,
+                    (h_izq_2d[1] + h_der_2d[1]) / 2
+                ]
+
+                p_craneo = [
+                    (o_izq_2d[0] + o_der_2d[0]) / 2,
+                    (o_izq_2d[1] + o_der_2d[1]) / 2
+                ]
+
+                dx_cuello = abs(p_craneo[0] - p_esternon[0])
+                dy_cuello = abs(p_esternon[1] - p_craneo[1])
+                inc_cuello = np.arctan2(dx_cuello, dy_cuello) * 180.0 / np.pi
+
+                inc_torso = np.abs(np.arctan2(
+                    h_der[1] - h_izq[1],
+                    h_der[0] - h_izq[0]
+                ) * 180.0 / np.pi)
+
+                if inc_torso > 90:
+                    inc_torso = 180 - inc_torso
+
+                actualizar_estado(
+                    f"{nombre_ejercicio} {brazo} | angulo {angulo_actual:.1f} | fase {fase} | reps {reps_buenas}/{reps_objetivo}"
+                )
+
+                if fase in ["SUBIENDO", "BAJANDO"] and angulo_actual > rom_repeticion:
+                    rom_repeticion = angulo_actual
+
+                tipo_trampa = None
+                magnitud_trampa = 0.0
+                umbral_trampa = 0.0
+                ahora = time.time()
+
+                angulo_codo_interno = calcular_angulo_3d(hombro, codo, muneca)
+                angulo_hombro = calcular_angulo_3d(cadera, hombro, codo)
+
+                if fase == "SUBIENDO":
+                    if nombre_ejercicio in ["abduccion", "flexion"] and inc_torso > 10.0:
+                        tipo_trampa = "TRAMPA_TORSO"
+                        magnitud_trampa = inc_torso
+                        umbral_trampa = 10.0
+
+                    elif nombre_ejercicio in ["abduccion", "flexion"] and inc_cuello > 12.0:
+                        tipo_trampa = "TRAMPA_CUELLO"
+                        magnitud_trampa = inc_cuello
+                        umbral_trampa = 12.0
+
+                    elif nombre_ejercicio in ["abduccion", "flexion"] and angulo_actual > 45 and angulo_codo_interno < 125:
+                        tipo_trampa = "TRAMPA_BRAZO_DOBLADO"
+                        magnitud_trampa = angulo_codo_interno
+                        umbral_trampa = 125.0
+
+                    elif nombre_ejercicio == "rotacion" and angulo_hombro > 40:
+                        tipo_trampa = "TRAMPA_CODO_SEPARADO"
+                        magnitud_trampa = angulo_hombro
+                        umbral_trampa = 40.0
+
+                    elif nombre_ejercicio == "codo":
+                        balanceo = abs(angulo_hombro - angulo_hombro_inicial)
+                        if balanceo > 25:
+                            tipo_trampa = "TRAMPA_BALANCEO"
+                            magnitud_trampa = balanceo
+                            umbral_trampa = 25.0
+
+                if tipo_trampa:
+                    if tipo_trampa == ultima_trampa_detectada:
+                        contador_trampa += 1
+                    else:
+                        contador_trampa = 1
+                        ultima_trampa_detectada = tipo_trampa
+                else:
+                    contador_trampa = 0
+                    ultima_trampa_detectada = None
+
+                if tipo_trampa and contador_trampa >= 8:
+                    if tipo_trampa not in trampas_avisadas_en_rep:
+                        trampas_avisadas_en_rep.add(tipo_trampa)
+                        trampas_detalle[tipo_trampa] += 1
+                        trampas_cometidas += 1
+                        trampa_en_esta_rep = True
+
+                        repeticion_estimada = intentadas + 1
+
+                        eventos_trampa_rep.append(
+                            crear_evento_trampa(
+                                tipo_trampa,
+                                repeticion_estimada,
+                                angulo_actual,
+                                magnitud_trampa,
+                                umbral_trampa
+                            )
+                        )
+
+                        if ahora - ultimo_aviso_trampa > 4:
+                            enviar_comando_nao(tipo_trampa)
+                            ultimo_aviso_trampa = ahora
+
+                if fase == "REPOSO" and angulo_actual > umbral_inicio:
+                    fase = "SUBIENDO"
+                    trampa_en_esta_rep = False
+                    sube_mas_avisado_en_rep = False
+                    estado_atorado = {"angulo_ref": angulo_actual, "tiempo_ref": ahora}
+                    trampas_avisadas_en_rep.clear()
+                    eventos_trampa_rep = []
+                    rom_repeticion = angulo_actual
+                    angulo_hombro_inicial = angulo_hombro
+                    inicio_subida = ahora
+
+                    if ahora - ultimo_aviso_movimiento > 3:
+                        enviar_comando_nao("ACOMPANAR_" + nombre_ejercicio.upper())
+                        ultimo_aviso_movimiento = ahora
+
+                elif fase == "SUBIENDO" and angulo_actual >= objetivo_grados:
+                    intentadas += 1
+                    numero_rep = intentadas
+                    historial_roms.append(rom_repeticion)
+                    fase = "BAJANDO"
+                    inicio_subida = None
+
+                    if eventos_trampa_rep:
+                        nombres = ", ".join([e["nombre"] for e in eventos_trampa_rep])
+                        magnitud_max = max([e["magnitud"] for e in eventos_trampa_rep])
+                        intervencion = eventos_trampa_rep[0]["intervencion"]
+                        resultado_rep = "Incorrecta"
+                    else:
+                        nombres = "Ninguna"
+                        magnitud_max = 0.0
+                        intervencion = "Ninguna"
+                        resultado_rep = "Correcta"
+
+                    detalle_repeticiones.append({
+                        "repeticion": numero_rep,
+                        "resultado": resultado_rep,
+                        "trampa": nombres,
+                        "magnitud": round(float(magnitud_max), 1),
+                        "angulo_rom": round(float(rom_repeticion), 1),
+                        "intervencion": intervencion,
+                        "eventos": list(eventos_trampa_rep)
+                    })
+
+                    if not trampa_en_esta_rep:
+                        reps_buenas += 1
+                        enviar_comando_nao("EXCELENTE")
+
+                    actualizar_estado(f"Repeticion registrada: {reps_buenas}/{reps_objetivo}")
+
+                elif fase == "SUBIENDO":
+                    falta_mucho = angulo_actual < (objetivo_grados - 10)
+                    atorado = actualizar_atorado(estado_atorado, angulo_actual, ahora)
+
+                    if falta_mucho and atorado and not sube_mas_avisado_en_rep:
+                        enviar_comando_nao("SUBE_MAS_" + nombre_ejercicio.upper())
+                        sube_mas_avisado_en_rep = True
+
+                elif fase == "BAJANDO" and angulo_actual < umbral_reposo_dinamico:
+                    fase = "REPOSO"
+                    inicio_subida = None
+
+            else:
+                actualizar_estado("No se detecta postura. Ponte frente a la camara.")
+
+            if MOSTRAR_CAMARA:
+                if res.pose_landmarks:
+                    mp_dibujo.draw_landmarks(frame, res.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+                cv2.putText(
+                    frame,
+                    f"{nombre_ejercicio} {brazo} | Rep: {reps_buenas}/{reps_objetivo} | Ang: {int(angulo_actual)} | {fase}",
+                    (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2
+                )
+
+                cv2.imshow("Monitor Terapia", frame)
+
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+    cap.release()
+
+    if MOSTRAR_CAMARA:
+        cv2.destroyAllWindows()
+
+    fluidez_texto, fluidez_valor = clasificar_fluidez(historial_angulos)
+
+    actualizar_estado(
+        f"Ejercicio terminado: {nombre_ejercicio} {brazo}. Buenas: {reps_buenas}, intentadas: {intentadas}"
+    )
+
+    return {
+        "reps_buenas": reps_buenas,
+        "intentadas": intentadas,
+        "trampas_totales": trampas_cometidas,
+        "trampas_detalle": trampas_detalle,
+        "historial_rom": historial_roms,
+        "fluidez": fluidez_texto,
+        "fluidez_valor": fluidez_valor,
+        "detalle_repeticiones": detalle_repeticiones
+    }
+
+
+# =========================================================================
+# HILO PRINCIPAL
+# =========================================================================
+
+def hilo_terapia(ejercicios, nombre_paciente, brazo_seleccionado, tipo_rutina, nivel):
+    global reporte_listo, terapia_activa
+
+    reporte_listo = None
+    terapia_activa = True
+
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    datos_reporte = []
+
+    try:
+        if brazo_seleccionado == "Ambos":
+            brazos_a_trabajar = ["Derecho", "Izquierdo"]
+        else:
+            brazos_a_trabajar = [brazo_seleccionado]
+
+        for clave in ejercicios:
+            if clave not in CONFIG_MOVIMIENTOS:
+                continue
+
+            config = CONFIG_MOVIMIENTOS[clave]
+
+            for brazo in brazos_a_trabajar:
+                if tipo_rutina == "completa":
+                    enviar_comando_nao(config["comando"] + "_COMPLETA")
+                else:
+                    enviar_comando_nao(config["comando"] + "_PERSONALIZADA")
+
+                datos_ejercicio = {
+                    "ejercicio": config["nombre"],
+                    "objetivo": config["objetivo"],
+                    "engagement_time": 0,
+                    "reps_buenas": 0,
+                    "intentadas": 0,
+                    "trampas_totales": 0,
+                    "trampas_detalle": crear_trampas_detalle(),
+                    "historial_rom": [],
+                    "brazo": brazo,
+                    "fluidez": "Sin datos suficientes",
+                    "fluidez_valor": 0.0,
+                    "detalle_repeticiones": []
+                }
+
+                series_a_hacer = config["series"]
+                tiempo_inicio_espera = time.time()
+                fluidez_valores = []
+
+                for serie_actual in range(1, series_a_hacer + 1):
+                    if serie_actual == 1:
+                        actualizar_estado("Esperando boton Paciente listo para iniciar la primera serie...")
+                    else:
+                        enviar_comando_nao("MITAD_SERIE")
+                        time.sleep(40)
+                        enviar_comando_nao("FIN_DESCANSO")
+                        actualizar_estado("Esperando boton Paciente listo para iniciar la siguiente serie...")
+
+                    evento_paciente_listo.clear()
+                    evento_paciente_listo.wait()
+
+                    if serie_actual == 1:
+                        datos_ejercicio["engagement_time"] = time.time() - tiempo_inicio_espera
+
+                    resultado = ejecutar_vision_terapia(
+                        clave,
+                        config["objetivo"],
+                        config["reps"],
+                        brazo
+                    )
+
+                    datos_ejercicio["reps_buenas"] += resultado["reps_buenas"]
+                    datos_ejercicio["intentadas"] += resultado["intentadas"]
+                    datos_ejercicio["trampas_totales"] += resultado["trampas_totales"]
+                    datos_ejercicio["historial_rom"].extend(resultado["historial_rom"])
+                    datos_ejercicio["detalle_repeticiones"].extend(resultado["detalle_repeticiones"])
+                    sumar_trampas_detalle(datos_ejercicio["trampas_detalle"], resultado["trampas_detalle"])
+
+                    fluidez_valores.append(resultado["fluidez_valor"])
+                    datos_ejercicio["fluidez"] = resultado["fluidez"]
+                    datos_ejercicio["fluidez_valor"] = float(np.mean(fluidez_valores)) if fluidez_valores else 0.0
+
+                    buenas_serie = resultado["reps_buenas"]
+                    intentadas_serie = resultado["intentadas"]
+                    porcentaje_serie = (buenas_serie / intentadas_serie * 100) if intentadas_serie > 0 else 0
+
+                    enviar_comando_nao(
+                        f"REPORTE_SERIE:{config['nombre']}:{serie_actual}:{intentadas_serie}:{buenas_serie}:{porcentaje_serie:.1f}"
+                    )
+
+                    time.sleep(6)
+
+                datos_reporte.append(datos_ejercicio)
+
+        total_intentadas = sum(ej["intentadas"] for ej in datos_reporte)
+        total_buenas = sum(ej["reps_buenas"] for ej in datos_reporte)
+        total_trampas = sum(ej["trampas_totales"] for ej in datos_reporte)
+        porcentaje_total = (total_buenas / total_intentadas * 100) if total_intentadas > 0 else 0
+
+        enviar_comando_nao(
+            f"REPORTE_FINAL:{total_intentadas}:{total_buenas}:{porcentaje_total:.1f}:{total_trampas}"
+        )
+
+        enviar_comando_nao("FIN_RUTINA_TOTAL")
+        generar_reporte_pdf(datos_reporte, nombre_paciente, timestamp_str, nivel)
+
+    except Exception as e:
+        actualizar_estado(f"Error en terapia: {e}")
+
+    finally:
+        terapia_activa = False
+
+
+# =========================================================================
+# RUTAS
+# =========================================================================
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/iniciar_terapia", methods=["POST"])
+def iniciar_terapia():
+    global terapia_activa
+
+    if terapia_activa:
+        return jsonify({
+            "status": "error",
+            "mensaje": "Ya hay una terapia activa"
+        }), 409
+
+    data = request.json or {}
+
+    nombre = data.get("nombre", "Paciente")
+    brazo = data.get("brazo", "Derecho")
+    tipo_rutina = data.get("tipo_rutina", "completa")
+    nivel = data.get("nivel", "1")
+
+    if tipo_rutina == "completa":
+        ejercicios = RUTINA_COMPLETA
+    else:
+        ejercicios = data.get("ejercicios", [])
+
+    if not ejercicios:
+        return jsonify({
+            "status": "error",
+            "mensaje": "No seleccionaste ejercicios"
+        }), 400
+
+    threading.Thread(
+        target=hilo_terapia,
+        args=(ejercicios, nombre, brazo, tipo_rutina, nivel),
+        daemon=True
+    ).start()
+
+    return jsonify({"status": "ok"})
+
+
+@app.route("/paciente_listo", methods=["GET"])
+def paciente_listo():
+    evento_paciente_listo.set()
+    actualizar_estado("Paciente listo recibido desde la interfaz")
+    return "OK"
+
+
+@app.route("/status_reporte", methods=["GET"])
+def status_reporte():
+    return jsonify({
+        "listo": reporte_listo is not None,
+        "archivo": reporte_listo,
+        "terapia_activa": terapia_activa,
+        "estado": ultimo_estado
+    })
+
+
+@app.route("/descargar/<nombre_archivo>")
+def descargar(nombre_archivo):
+    return send_from_directory(carpeta_reportes, nombre_archivo, as_attachment=True)
+
+
+@app.route("/probar_mochi", methods=["GET"])
+def probar_mochi():
+    ok = enviar_comando_nao("EXCELENTE")
+    return jsonify({"ok": ok})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080, threaded=True)
