@@ -1,0 +1,314 @@
+import socket #codigo choreographe 
+import threading
+import random
+import time
+import Queue
+from naoqi import ALProxy
+
+
+class MyClass(GeneratedClass):
+    def __init__(self):
+        GeneratedClass.__init__(self)
+
+        self.running = False
+        self.server_socket = None
+        self.server_thread = None
+        self.worker_thread = None
+        self.cola_mensajes = Queue.Queue()
+
+        self.ip = "0.0.0.0"
+        self.port = 5000
+
+        self.tts = None
+        self.leds = None
+        self.final_report_done = False
+
+        self.frases_motivadoras = [
+            "Muy bien.",
+            "Excelente.",
+            "Sigue asi.",
+            "Que buen movimiento.",
+            "Perfecto.",
+            "Vas por muy buen camino."
+        ]
+
+    def onLoad(self):
+        pass
+
+    def onUnload(self):
+        self.running = False
+
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except Exception as e:
+                print("Error cerrando servidor:", e)
+
+    def onInput_onStart(self):
+        if self.running:
+            return
+
+        try:
+            self.tts = ALProxy("ALTextToSpeech")
+            self.leds = ALProxy("ALLeds")
+            self.ojos_blancos()
+        except Exception as e:
+            print("Error iniciando proxies:", e)
+
+        self.running = True
+        self.final_report_done = False
+
+        self.server_thread = threading.Thread(target=self.server_loop)
+        self.server_thread.start()
+
+        self.worker_thread = threading.Thread(target=self.procesar_cola)
+        self.worker_thread.start()
+
+        self.hablar("Estoy listo para la terapia.")
+
+    def onInput_onStop(self):
+        self.onUnload()
+        self.onStopped()
+
+    def server_loop(self):
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.ip, self.port))
+            self.server_socket.listen(5)
+            self.server_socket.settimeout(1.0)
+
+            print("Servidor de Mochi escuchando en puerto 5000")
+
+            while self.running:
+                try:
+                    conn, addr = self.server_socket.accept()
+                    data = conn.recv(1024)
+
+                    if data:
+                        mensaje = data.decode("utf-8").strip()
+                        print("MENSAJE RECIBIDO:", mensaje)
+                        self.cola_mensajes.put(mensaje)
+
+                    conn.close()
+
+                except socket.timeout:
+                    continue
+
+                except Exception as e:
+                    print("ERROR EN SERVER_LOOP:", e)
+
+        except Exception as e:
+            print("No se pudo iniciar servidor:", e)
+
+    def procesar_cola(self):
+        while self.running:
+            try:
+                mensaje = self.cola_mensajes.get(timeout=1.0)
+                self.procesar_mensaje(mensaje)
+                self.cola_mensajes.task_done()
+
+            except Queue.Empty:
+                continue
+
+            except Exception as e:
+                print("ERROR PROCESANDO COLA:", e)
+
+    def procesar_mensaje(self, mensaje):
+        try:
+            if mensaje == "DEMO_ABDUCCION_COMPLETA":
+                self.hablar("Para iniciar la sesion, haremos elevaciones laterales. Aprenderemos por imitacion, asi que yo te mostrare el movimiento primero 3 veces.")
+                self.hablar(" Trabajaremos este primer bloque con una serie de 12 repeticiones validas. Entre mas controlado hagas el movimiento, mejor podre contar tus repeticiones.")
+                self.hablar("Es importante que mantengas tu palma hacia abajo y el brazo lo mas estirado posible.")
+                self.hablar("La camara estara evaluando tu postura. Recuerda no inclinar tu cuerpo ni tu cuello hacia los lados para compensar el esfuerzo. Manten tu tronco firme. Si aparece una compensacion, te avisare y esa repeticion no contara. ")
+                self.hablar("Yo te estare apoyando. Cada vez que logres la altura correcta con buena postura, encendere luces verdes y te felicitare.")
+                self.hablar("Vamos a la demostracion.")
+                self.demo_abduccion()
+
+            elif mensaje == "DEMO_FLEXION_COMPLETA":
+                self.hablar("Excelente trabajo con el primer bloque.")
+                self.hablar("Ahora pasaremos a la flexion anterior. Trabajaremos con 2 series de 10 repeticiones.")
+                self.hablar("Para este movimiento, levanta tu brazo hacia el frente, como si quisieras senalar algo adelante de ti.")
+                self.hablar("Mucho ojo: evita arquear la espalda hacia atras. Mantente estable y con el abdomen firme. Si compensas, esa repeticion no contara. Vamos con la demostracion.")
+                self.demo_flexion()
+
+            elif mensaje == "DEMO_ROTACION_COMPLETA":
+                self.hablar("Muy bien, seguimos con rotacion externa. Pega tus codos a las costillas y dobla los brazos a 90 grados, como si sostuvieras una bandeja.")
+                self.hablar("Desde esa posicion, gira tus manos hacia afuera sin despegar los codos de tus lados. Haremos 1 serie con 8 repeticiones.")
+                self.hablar("Evita girar todo el torso para compensar. Manten tu pecho apuntando hacia mi y mueve solo los brazos. Si separas el codo o compensas, esa repeticion no contara. Observa como lo hago yo.")
+                self.demo_rotacion()
+
+            elif mensaje == "DEMO_CODO_COMPLETA":
+                self.hablar(" Ultimo esfuerzo, cerramos con flexion de codo. Deja tus brazos cerca del cuerpo con las palmas viendo hacia el frente. Haremos 2 series de 10 repeticiones.")
+                self.hablar("Dobla el codo para llevar tu mano hacia el hombro y luego bajala lentamente.")
+                self.hablar("Evita balancear el cuerpo hacia atras o separar demasiado el codo de tus costillas. Si tomas impulso, esa repeticion no contara. Mira la demostracion.")
+                self.demo_codo()
+
+            elif mensaje == "DEMO_ABDUCCION_PERSONALIZADA":
+                self.hablar("Vamos a trabajar elevaciones laterales. Haras una serie de 12 repeticiones validas. Si compensas, esa repeticion no contara. Observa la demostracion y despues presiona paciente listo en la pantalla.")
+                self.demo_abduccion()
+
+            elif mensaje == "DEMO_FLEXION_PERSONALIZADA":
+                self.hablar("Vamos a trabajar flexion anterior. Levanta el brazo hacia el frente con control. Si compensas, esa repeticion no contara. Observa la demostracion y despues presiona paciente listo en la pantalla.")
+                self.demo_flexion()
+
+            elif mensaje == "DEMO_ROTACION_PERSONALIZADA":
+                self.hablar("Vamos a trabajar rotacion externa. Manten los codos cerca del cuerpo y gira las manos hacia afuera. Si separas el codo o giras el torso, esa repeticion no contara. Observa la demostracion y despues presiona paciente listo en la pantalla.")
+                self.demo_rotacion()
+
+            elif mensaje == "DEMO_CODO_PERSONALIZADA":
+                self.hablar("Vamos a trabajar flexion de codo. Dobla el codo llevando la mano hacia el hombro y baja lentamente. Si te balanceas, esa repeticion no contara. Observa la demostracion y despues presiona paciente listo en la pantalla.")
+                self.demo_codo()
+
+            elif mensaje == "ACOMPANAR_ABDUCCION" or mensaje == "SUBIENDO_BRAZO":
+                self.acompanar_abduccion()
+
+            elif mensaje == "ACOMPANAR_FLEXION":
+                self.acompanar_flexion()
+
+            elif mensaje == "ACOMPANAR_ROTACION":
+                self.acompanar_rotacion()
+
+            elif mensaje == "ACOMPANAR_CODO":
+                self.acompanar_codo()
+
+            elif mensaje == "FIN_DESCANSO":
+                self.hablar("Se acabo el descanso. Cuando estes listo, presiona el boton de paciente listo en la pantalla para iniciar la siguiente serie.")
+
+            elif mensaje == "EXCELENTE":
+                self.ojos_verdes()
+                self.hablar(random.choice(self.frases_motivadoras))
+                self.restaurar_ojos(2.0)
+
+            elif mensaje == "SUBE_MAS" or mensaje == "SUBE_MAS_ABDUCCION":
+                self.hablar("Eleva un poco mas el brazo hacia el lado, tu puedes.")
+
+            elif mensaje == "SUBE_MAS_FLEXION":
+                self.hablar("Sube un poco mas el brazo hacia el frente, tu puedes.")
+
+            elif mensaje == "SUBE_MAS_ROTACION":
+                self.hablar("Gira un poco mas la mano hacia afuera, sin despegar el codo.")
+
+            elif mensaje == "SUBE_MAS_CODO":
+                self.hablar("Dobla un poco mas el codo, con control.")
+
+            elif mensaje == "TRAMPA_BRAZO_DOBLADO":
+                self.ojos_rojos()
+                self.hablar("Intenta mantener el brazo mas estirado. Esa repeticion no conto.")
+                self.restaurar_ojos(1.5)
+
+            elif mensaje == "TRAMPA_TORSO":
+                self.ojos_rojos()
+                self.hablar("Cuida tu postura. Manten el tronco estable. Esa repeticion no conto.")
+                self.restaurar_ojos(1.5)
+
+            elif mensaje == "TRAMPA_CUELLO":
+                self.ojos_rojos()
+                self.hablar("Relaja el cuello y mira al frente. Esa repeticion no conto.")
+                self.restaurar_ojos(1.5)
+
+            elif mensaje == "TRAMPA_CODO_SEPARADO":
+                self.ojos_rojos()
+                self.hablar("Manten el codo cerca de tu cuerpo. Esa repeticion no conto.")
+                self.restaurar_ojos(1.5)
+
+            elif mensaje == "TRAMPA_BALANCEO":
+                self.ojos_rojos()
+                self.hablar("Evita balancearte. Hazlo lento y controlado. Esa repeticion no conto.")
+                self.restaurar_ojos(1.5)
+
+            elif mensaje == "TRAMPA_REP_INVALIDA":
+                self.ojos_rojos()
+                self.hablar("Esa repeticion no conto. Intentemos la siguiente con mejor control.")
+                self.restaurar_ojos(1.5)
+
+            elif mensaje == "MITAD_SERIE":
+                self.ojos_verdes()
+                self.hablar("Muy bien. Terminaste esta serie. Ahora descansa 40 segundos antes de continuar.")
+                self.hablar("Respira tranquilo. Yo te avisare cuando sea momento de seguir.")
+                self.restaurar_ojos(2.0)
+
+            elif mensaje.startswith("REPORTE_SERIE"):
+                datos = mensaje.split(":")
+
+                if len(datos) >= 6:
+                    ejercicio = datos[1]
+                    serie = datos[2]
+                    intentadas = datos[3]
+                    buenas = datos[4]
+                    porcentaje = datos[5]
+
+                    self.ojos_verdes()
+                    self.hablar("Serie " + serie + " terminada.")
+                    self.hablar("En " + ejercicio + ", hiciste " + buenas + " repeticiones validas de " + intentadas + " intentos.")
+                    self.hablar("Tu efectividad fue del " + porcentaje + " por ciento.")
+                    self.restaurar_ojos(2.0)
+
+            elif mensaje.startswith("REPORTE_FINAL"):
+                datos = mensaje.split(":")
+
+                if len(datos) >= 5:
+                    intentadas = datos[1]
+                    buenas = datos[2]
+                    porcentaje = datos[3]
+                    trampas = datos[4]
+
+                    self.final_report_done = True
+                    self.ojos_verdes()
+                    self.hablar("Felicidades. Terminaste todas tus series de hoy.")
+                    self.hablar("En total hiciste " + buenas + " repeticiones validas de " + intentadas + " intentos.")
+                    self.hablar("Tu efectividad general fue del " + porcentaje + " por ciento.")
+                    self.hablar("Detecte " + trampas + " compensaciones durante la rutina.")
+                    self.hablar("Excelente esfuerzo. Vamos a ver tu reporte en la pantalla.")
+                    self.restaurar_ojos(2.0)
+                    self.fin_rutina()
+
+            elif mensaje == "FIN_RUTINA_TOTAL":
+                if not self.final_report_done:
+                    self.hablar("Felicidades. Hemos terminado la rutina. Vamos a ver tu reporte en la pantalla.")
+                    self.fin_rutina()
+
+            else:
+                print("Comando no reconocido:", mensaje)
+
+        except Exception as e:
+            print("Error procesando mensaje:", e)
+
+    def hablar(self, texto):
+        try:
+            if self.tts is None:
+                self.tts = ALProxy("ALTextToSpeech")
+            self.tts.say(texto)
+        except Exception as e:
+            print("ERROR hablando:", e)
+
+    def ojos_verdes(self):
+        try:
+            if self.leds is None:
+                self.leds = ALProxy("ALLeds")
+            self.leds.fadeRGB("FaceLeds", 0.0, 1.0, 0.0, 0.1)
+        except Exception as e:
+            print("ERROR ojos verdes:", e)
+
+    def ojos_rojos(self):
+        try:
+            if self.leds is None:
+                self.leds = ALProxy("ALLeds")
+            self.leds.fadeRGB("FaceLeds", 1.0, 0.0, 0.0, 0.1)
+        except Exception as e:
+            print("ERROR ojos rojos:", e)
+
+    def ojos_blancos(self):
+        try:
+            if self.leds is None:
+                self.leds = ALProxy("ALLeds")
+            self.leds.fadeRGB("FaceLeds", 1.0, 1.0, 1.0, 0.5)
+        except Exception as e:
+            print("ERROR ojos blancos:", e)
+
+    def restaurar_ojos(self, tiempo):
+        def tarea():
+            time.sleep(tiempo)
+            self.ojos_blancos()
+
+        threading.Thread(target=tarea).start()
