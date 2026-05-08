@@ -1,0 +1,358 @@
+<!DOCTYPE html> #codigo index.html
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Terapia con Mochi</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <style>
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f3f4f6;
+            color: #111827;
+        }
+
+        header {
+            background: #0f766e;
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+
+        main {
+            max-width: 850px;
+            margin: 24px auto;
+            padding: 0 16px;
+        }
+
+        section {
+            background: white;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+
+        h1, h2 {
+            margin-top: 0;
+        }
+
+        label {
+            display: block;
+            margin-top: 12px;
+            font-weight: bold;
+        }
+
+        input[type="text"], select {
+            width: 100%;
+            padding: 12px;
+            margin-top: 6px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .opcion {
+            background: #f9fafb;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            padding: 12px;
+            font-weight: normal;
+        }
+
+        .opcion input {
+            margin-right: 8px;
+        }
+
+        button {
+            background: #0f766e;
+            color: white;
+            border: 0;
+            border-radius: 6px;
+            padding: 14px 18px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #115e59;
+        }
+
+        .secundario {
+            background: #374151;
+        }
+
+        .secundario:hover {
+            background: #1f2937;
+        }
+
+        #mensaje {
+            margin-top: 16px;
+            padding: 12px;
+            border-radius: 6px;
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        #mensaje.ok {
+            background: #dcfce7;
+            color: #166534;
+        }
+
+        #mensaje.error {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .oculto {
+            display: none;
+        }
+
+        .acciones {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        a.boton {
+            display: inline-block;
+            margin-top: 12px;
+            background: #0f766e;
+            color: white;
+            text-decoration: none;
+            border-radius: 6px;
+            padding: 12px 16px;
+        }
+
+        a.boton:hover {
+            background: #115e59;
+        }
+    </style>
+</head>
+
+<body>
+<header>
+    <h1>Terapia con Mochi</h1>
+</header>
+
+<main>
+    <section>
+        <h2>Datos del paciente</h2>
+
+        <label for="nombre">Nombre</label>
+        <input type="text" id="nombre" placeholder="Nombre del paciente">
+
+        <label for="brazo">Brazo a trabajar</label>
+        <select id="brazo">
+            <option value="Derecho">Derecho</option>
+            <option value="Izquierdo">Izquierdo</option>
+            <option value="Ambos">Ambos</option>
+        </select>
+    </section>
+
+    <section>
+        <h2>Tipo de rutina</h2>
+
+        <div class="grid">
+            <label class="opcion">
+                <input type="radio" name="tipo_rutina" value="completa" checked>
+                Rutina completa
+            </label>
+
+            <label class="opcion">
+                <input type="radio" name="tipo_rutina" value="personalizada">
+                Rutina personalizada
+            </label>
+        </div>
+    </section>
+
+    <section id="seccion_movimientos" class="oculto">
+        <h2>Movimientos</h2>
+
+        <div class="grid">
+            <label class="opcion">
+                <input type="checkbox" class="movimiento" value="abduccion">
+                Abducción
+            </label>
+
+            <label class="opcion">
+                <input type="checkbox" class="movimiento" value="flexion">
+                Flexión anterior
+            </label>
+
+            <label class="opcion">
+                <input type="checkbox" class="movimiento" value="rotacion">
+                Rotación externa
+            </label>
+
+            <label class="opcion">
+                <input type="checkbox" class="movimiento" value="codo">
+                Flexión de codo
+            </label>
+        </div>
+    </section>
+
+    <section>
+        <h2>Control</h2>
+
+        <div class="acciones">
+            <button onclick="iniciarTerapia()">Iniciar terapia</button>
+            <button class="secundario" onclick="pacienteListo()">Paciente listo</button>
+            <button class="secundario" onclick="probarMochi()">Probar Mochi</button>
+        </div>
+
+        <div id="mensaje">Sistema listo.</div>
+        <div id="descarga"></div>
+    </section>
+</main>
+
+<script>
+    const radiosRutina = document.querySelectorAll('input[name="tipo_rutina"]');
+    const seccionMovimientos = document.getElementById('seccion_movimientos');
+    const mensajeDiv = document.getElementById('mensaje');
+    const descargaDiv = document.getElementById('descarga');
+
+    let checkInterval = null;
+
+    radiosRutina.forEach(radio => {
+        radio.addEventListener('change', actualizarVistaRutina);
+    });
+
+    function actualizarVistaRutina() {
+        const tipo = document.querySelector('input[name="tipo_rutina"]:checked').value;
+
+        if (tipo === "personalizada") {
+            seccionMovimientos.classList.remove("oculto");
+        } else {
+            seccionMovimientos.classList.add("oculto");
+        }
+    }
+
+    function obtenerMovimientosSeleccionados() {
+        const checks = document.querySelectorAll('.movimiento:checked');
+        return Array.from(checks).map(check => check.value);
+    }
+
+    function mostrarMensaje(texto, tipo) {
+        mensajeDiv.innerText = texto;
+        mensajeDiv.className = tipo || "";
+    }
+
+    function iniciarEscuchaPDF() {
+        if (checkInterval) {
+            clearInterval(checkInterval);
+        }
+
+        checkInterval = setInterval(() => {
+            fetch('/status_reporte')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.estado) {
+                        mostrarMensaje(data.estado, data.listo ? "ok" : "");
+                    }
+
+                    if (data.listo && data.archivo) {
+                        clearInterval(checkInterval);
+                        checkInterval = null;
+
+                        mostrarMensaje("¡Terapia finalizada! Abriendo reporte...", "ok");
+
+                        descargaDiv.innerHTML = `
+                            <a class="boton" href="/descargar/${data.archivo}" target="_blank">
+                                Abrir / descargar reporte PDF
+                            </a>
+                        `;
+
+                        window.location.href = '/descargar/' + data.archivo;
+                    }
+                })
+                .catch(() => {
+                    mostrarMensaje("No se pudo consultar el estado del reporte.", "error");
+                });
+        }, 3000);
+    }
+
+    function iniciarTerapia() {
+        const nombre = document.getElementById('nombre').value.trim() || "Paciente";
+        const brazo = document.getElementById('brazo').value;
+        const tipoRutina = document.querySelector('input[name="tipo_rutina"]:checked').value;
+
+        let seleccionados = [];
+
+        if (tipoRutina === "personalizada") {
+            seleccionados = obtenerMovimientosSeleccionados();
+
+            if (seleccionados.length === 0) {
+                mostrarMensaje("Selecciona al menos un movimiento para la rutina personalizada.", "error");
+                return;
+            }
+        }
+
+        descargaDiv.innerHTML = "";
+        mostrarMensaje("Iniciando terapia...", "");
+
+        fetch('/iniciar_terapia', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                nombre: nombre,
+                tipo_rutina: tipoRutina,
+                ejercicios: seleccionados,
+                brazo: brazo
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.status === "ok") {
+                mostrarMensaje("Terapia en curso. El reporte se abrirá automáticamente al terminar...", "ok");
+                iniciarEscuchaPDF();
+            } else {
+                mostrarMensaje(data.mensaje || "No se pudo iniciar la terapia.", "error");
+            }
+        })
+        .catch(() => {
+            mostrarMensaje("Error al iniciar la terapia.", "error");
+        });
+    }
+
+    function pacienteListo() {
+        fetch('/paciente_listo')
+            .then(() => {
+                mostrarMensaje("Paciente listo enviado.", "ok");
+            })
+            .catch(() => {
+                mostrarMensaje("No se pudo enviar paciente listo.", "error");
+            });
+    }
+
+    function probarMochi() {
+        fetch('/probar_mochi')
+            .then(response => response.json())
+            .then(data => {
+                if (data.ok) {
+                    mostrarMensaje("Mochi recibió el comando de prueba.", "ok");
+                } else {
+                    mostrarMensaje("Mochi no respondió. Revisa IP, puerto y Choregraphe.", "error");
+                }
+            })
+            .catch(() => {
+                mostrarMensaje("No se pudo probar la conexión con Mochi.", "error");
+            });
+    }
+
+    actualizarVistaRutina();
+</script>
+
+</body>
+</html>
